@@ -1,0 +1,197 @@
+import os
+import fitz  # PyMuPDF
+from tqdm.auto import tqdm
+import pandas as pd
+from sentence_transformers import CrossEncoder, SentenceTransformer, util
+import chromadb
+import torch
+import shutil  # Add this import for directory removal
+from groq import Groq
+
+# Initialize ChromaDB client with the new settings
+client = chromadb.PersistentClient(path="./chroma_store")
+
+# Delete existing collection if it exists
+
+
+collection = client.get_or_create_collection(
+    name="laws_document_v2",
+     # Using cosine similarity
+)
+
+# Initialize Groq client
+groq_client = Groq(api_key="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")
+
+# Initialize embedding model
+device = "cuda" if torch.cuda.is_available() else "cpu"
+embedding_model = SentenceTransformer("BAAI/bge-m3")
+
+# Function to get embeddings0
+def get_embedding(text: str) -> list[float]:
+    return embedding_model.encode(text, convert_to_numpy=True).tolist()
+
+# Step 6: Load cross-encoder for re-ranking
+cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+
+# Check if collection is empty (no documents)
+existing = collection.count()
+print(existing)
+
+if existing == 0:
+    # Step 1: Read and format PDF
+    def text_formater(text: str) -> str:
+        """Performs some formatting on the text"""
+        cleaned_text = text.replace("\n", " ").strip()
+        return cleaned_text
+
+    def split_into_articles(text: str) -> list[str]:
+        """Split text into articles based on article numbers, chapters, and sections"""
+        # Split by "المادة" (Article), "الفصل" (Chapter), or "الباب" (Section) followed by a number
+        articles = []
+        current_article = []
+        
+        # Split text into lines
+        lines = text.split(". ")
+        
+        for line in lines:
+            # Check if line starts with any of the specified patterns followed by a number
+            if any(line.strip().startswith(pattern) for pattern in ["المادة", "الفصل", "الباب"]):
+                # If we have a previous article, save it
+                if current_article:
+                    articles.append(". ".join(current_article))
+                # Start new article
+                current_article = [line]
+            else:
+                # Add line to current article
+                current_article.append(line)
+        
+        # Add the last article
+        if current_article:
+            articles.append(". ".join(current_article))
+        
+        return articles
+
+    def open_and_read(pdf_path: str) -> list[dict]:
+        doc = fitz.open(pdf_path)
+        pages_and_text = []
+        for page_number, page in tqdm(enumerate(doc)):
+            text = page.get_text()
+            text = text_formater(text=text)
+            # Split into articles
+            articles = split_into_articles(text)
+            for article_number, article_text in enumerate(articles):
+                pages_and_text.append({
+                    "page_number": page_number,
+                    "article_number": article_number,
+                    "article_char_count": len(article_text),
+                    "article_word_count": len(article_text.split(" ")),
+                    "article_token_count": len(article_text) / 4,
+                    "text": article_text,
+                })
+        return pages_and_text
+
+    pdf_path = "law2.pdf"
+    pages_and_text = open_and_read(pdf_path=pdf_path)
+
+    # Step 4: Prepare Chunks (now each chunk is an article)
+    pages_and_chunks = []
+    for item in tqdm(pages_and_text):
+        pages_and_chunks.append({
+            'page_number': item['page_number'],
+            'article_number': item['article_number'],
+            'sentence_chunk': item['text'],  # The entire article text
+            'chunk_char_count': item['article_char_count'],
+            'chunk_word_count': item['article_word_count'],
+            'chunk_token_count': item['article_token_count'],
+        })
+
+    df = pd.DataFrame(pages_and_chunks)
+
+    # Step 7: Embed and store chunks in Chroma
+    for chunk in tqdm(pages_and_chunks):
+        chunk_text = f"passage: {chunk['sentence_chunk']}"  # E5 format
+        chunk_embedding = get_embedding(chunk_text)  # Use Groq's embedding model
+        collection.add(
+            documents=[chunk['sentence_chunk']],
+            embeddings=[chunk_embedding],
+            metadatas=[{
+                "page_number": chunk['page_number'],
+                "article_number": chunk['article_number']
+            }],
+            ids=[f"article_{chunk['article_number']}_page_{chunk['page_number']}"]
+        )
+    print("Embedding and indexing complete. Ready for queries.")
+else:
+    print(f"Collection already contains {existing} documents. Skipping embedding and indexing.")
+
+# Step 8: Query function with re-ranking and LLM processing
+def query_rag(question: str, n_results: int = 40):  # Increased from 5 to 10 for better coverage
+    query_text = f"query: {question}"  # E5 format
+    question_embedding = get_embedding(query_text)  # Use Groq's embedding model
+    
+    # Get more results than needed for re-ranking
+    result = collection.query(
+        query_embeddings=[question_embedding],
+        n_results=n_results * 2  # Get more results for re-ranking
+    )
+    
+    # Prepare pairs for cross-encoder
+    pairs = [(question, doc) for doc in result['documents'][0]]
+    
+    # Re-rank using cross-encoder
+    scores = cross_encoder.predict(pairs)
+    
+    # Combine documents with their scores
+    doc_score_pairs = list(zip(result['documents'][0], scores))
+    
+    # Sort by score and get top n_results
+    ranked_results = sorted(doc_score_pairs, key=lambda x: x[1], reverse=True)[:n_results]
+    
+    # Get the top chunks
+    top_chunks = [doc for doc, score in ranked_results]
+    
+    # Prepare context for LLM
+    context = "\n\n".join(top_chunks)
+    
+    # Create prompt for LLM
+    prompt = f"""Based on the following legal text ->Context:{context}
+    this is the user query ->{question}
+    from your understanding to the context,answer the user query,whether it's a question or a request for information.
+    
+
+if the user query is about a specific article ,give the article number and the article text without changing the text."""
+
+    # Get response from Groq LLM
+    completion = groq_client.chat.completions.create(
+        model="meta-llama/llama-4-scout-17b-16e-instruct",
+        messages=[
+            {"role": "system", "content": "You are a helpful legal assistant that provides clear and accurate answers based on the provided context."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.3,
+        max_tokens=1024,
+    )
+    
+    return top_chunks, completion.choices[0].message.content
+
+# Example usage
+query = "المادة 1"
+print("\n" + "="*50)
+print(f"QUERY: {query}")
+print("="*50)
+
+top_chunks, llm_response = query_rag(query)
+
+print("\nRETRIEVED CHUNTS:")
+print("-"*50)
+for i, chunk in enumerate(top_chunks, 1):
+    print(f"\nChunk {i}:")
+    print("-"*20)
+    print(chunk)
+    print("-"*20)
+
+print("\n" + "="*50)
+print("LLM RESPONSE:")
+print("="*50)
+print(llm_response)
+print("="*50)

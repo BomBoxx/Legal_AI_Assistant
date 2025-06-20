@@ -1,0 +1,544 @@
+import os
+import fitz  # PyMuPDF
+from tqdm.auto import tqdm
+import pandas as pd
+from sentence_transformers import SentenceTransformer, util
+import chromadb
+import torch
+import google.generativeai as genai
+import re
+import unicodedata
+from typing import List, Dict, Tuple
+import numpy as np
+from collections import Counter
+
+# Initialize ChromaDB client with the new settings
+client = chromadb.PersistentClient(path="./chroma_store")
+
+# Get or create collection
+collection = client.get_or_create_collection(
+    name="laws_document_v3",
+)
+
+# Initialize Gemini client
+genai.configure(api_key="AIzaSyCnTzpExXPleDIJUsRSjoUBGVTiJILMV3s")
+gemini_model = genai.GenerativeModel('gemini-2.5-flash')
+
+# Initialize embedding model
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {device}")
+embedding_model = SentenceTransformer("BAAI/bge-m3", device=device)
+
+def normalize_arabic_text(text: str) -> str:
+    """
+    Normalize Arabic text by removing diacritics and standardizing characters
+    """
+    # Remove diacritics
+    text = unicodedata.normalize('NFKD', text)
+    text = ''.join([c for c in text if not unicodedata.combining(c)])
+    
+    # Standardize Arabic characters
+    text = text.replace('أ', 'ا').replace('إ', 'ا').replace('آ', 'ا')
+    text = text.replace('ى', 'ي').replace('ة', 'ه')
+    
+    return text
+
+def calculate_text_overlap(query: str, text: str) -> float:
+    """
+    Calculate text overlap between query and text
+    """
+    query_words = set(normalize_arabic_text(query).split())
+    text_words = set(normalize_arabic_text(text).split())
+    
+    if not query_words or not text_words:
+        return 0.0
+    
+    intersection = query_words.intersection(text_words)
+    return len(intersection) / len(query_words)
+
+def calculate_position_score(text: str, query: str) -> float:
+    """
+    Calculate score based on position of matching terms
+    """
+    query_words = set(normalize_arabic_text(query).split())
+    text_words = normalize_arabic_text(text).split()
+    
+    if not query_words or not text_words:
+        return 0.0
+    
+    # Find positions of matching words
+    positions = []
+    for i, word in enumerate(text_words):
+        if word in query_words:
+            positions.append(i)
+    
+    if not positions:
+        return 0.0
+    
+    # Calculate average position (normalized)
+    avg_position = sum(positions) / len(positions)
+    position_score = 1.0 - (avg_position / len(text_words))
+    
+    return position_score
+
+def get_embedding(text: str) -> list[float]:
+    """
+    Get embedding with improved text preprocessing
+    """
+    try:
+        # Normalize text before embedding
+        normalized_text = normalize_arabic_text(text)
+        embedding = embedding_model.encode(normalized_text, convert_to_numpy=True).tolist()
+        return embedding
+    except Exception as e:
+        print(f"Error generating embedding: {e}")
+        return []
+
+def calculate_hybrid_score(article: Dict, query: str, distance: float, max_distance: float) -> float:
+    """
+    Calculate hybrid score combining multiple factors
+    """
+    # Normalize distance to similarity score (0 to 1)
+    similarity_score = 1.0 - (distance / max_distance)
+    
+    # Calculate text overlap score
+    overlap_score = calculate_text_overlap(query, article['text'])
+    
+    # Calculate position score
+    position_score = calculate_position_score(article['text'], query)
+    
+    # Calculate length score (penalize very short or very long articles)
+    length = len(article['text'])
+    length_score = 1.0 - abs(0.5 - (length / 2000))  # Assuming optimal length around 2000 chars
+    
+    # Combine scores with weights
+    final_score = (
+        0.4 * similarity_score +  # Semantic similarity
+        0.3 * overlap_score +    # Text overlap
+        0.2 * position_score +   # Position of matches
+        0.1 * length_score       # Length normalization
+    )
+    
+    return final_score
+
+# Enhanced Query function
+def query_rag(question: str, n_results: int = 40):
+    """
+    Query the RAG system for relevant articles with improved scoring
+    """
+    print(f"\n{'='*50}")
+    print(f"Processing query: {question}")
+    print(f"{'='*50}")
+    
+    # Check if collection has documents
+    collection_count = collection.count()
+    if collection_count == 0:
+        print("Error: Collection is empty!")
+        return [], "لا توجد وثائق في قاعدة البيانات."
+    
+    print(f"Collection contains {collection_count} articles")
+    
+    # Generate query embedding with preprocessing
+    query_text = f"query: {question}"
+    question_embedding = get_embedding(query_text)
+    
+    if not question_embedding:
+        print("Error: Could not generate query embedding")
+        return [], "خطأ في معالجة الاستعلام."
+    
+    try:
+        # Get results from ChromaDB
+        result = collection.query(
+            query_embeddings=[question_embedding],
+            n_results=min(n_results, collection_count),  # Get more results for better ranking
+            include=['documents', 'metadatas', 'distances']
+        )
+        
+        if not result['documents'] or not result['documents'][0]:
+            print("No relevant articles found!")
+            return [], "لم يتم العثور على مواد قانونية ذات صلة."
+        
+        retrieved_docs = result['documents'][0]
+        retrieved_metadata = result['metadatas'][0]
+        distances = result['distances'][0]
+        
+        print(f"Retrieved {len(retrieved_docs)} articles from database")
+        
+        # Calculate max distance for normalization
+        max_distance = max(distances) if distances else 1.0
+        
+        # Create ranked articles list with hybrid scoring
+        ranked_articles = []
+        for i, doc in enumerate(retrieved_docs):
+            article = {
+                'text': doc,
+                'metadata': retrieved_metadata[i],
+                'distance': distances[i]
+            }
+            
+            # Calculate hybrid score
+            score = calculate_hybrid_score(article, question, distances[i], max_distance)
+            
+            ranked_articles.append({
+                'text': doc,
+                'score': score,
+                'metadata': retrieved_metadata[i],
+                'distance': distances[i]
+            })
+        
+        # Sort by hybrid score
+        ranked_articles = sorted(ranked_articles, key=lambda x: x['score'], reverse=True)[:n_results]
+        
+        # Extract top articles
+        top_articles = [article['text'] for article in ranked_articles]
+        
+        print(f"Selected {len(top_articles)} top articles:")
+        for i, article in enumerate(ranked_articles):
+            article_num = article['metadata'].get('article_number', 'غير محدد')
+            print(f"  {i+1}. مادة {article_num} - Score: {article['score']:.3f} - {len(article['text'])} chars")
+        
+        # Prepare context for LLM with size management
+        MAX_CONTEXT_CHARS = 20000  # Roughly 5000 tokens
+        MAX_ARTICLE_CHARS = 4000   # Max chars per article
+        
+        context_parts = []
+        total_chars = 0
+        
+        print("Preparing context with size limits...")
+        
+        for i, article in enumerate(ranked_articles):
+            article_num = article['metadata'].get('article_number', str(i+1))
+            article_text = article['text']
+            
+            # Truncate individual article if too long
+            if len(article_text) > MAX_ARTICLE_CHARS:
+                article_text = article_text[:MAX_ARTICLE_CHARS] + "\n[... نص المادة مقطوع للاختصار ...]"
+                print(f"  Article {article_num} truncated from {len(article['text'])} to {len(article_text)} chars")
+            
+            article_formatted = f"مادة {article_num}:\n{article_text}"
+            
+            # Check if adding this article would exceed total limit
+            if total_chars + len(article_formatted) > MAX_CONTEXT_CHARS:
+                print(f"  Stopping at article {i+1} to avoid context limit")
+                break
+                
+            context_parts.append(article_formatted)
+            total_chars += len(article_formatted)
+            print(f"  Added article {article_num}: {len(article_text)} chars")
+        
+        context = "\n\n" + "="*30 + "\n\n".join(context_parts)
+        
+        print(f"Final context: {len(context)} characters (~{len(context)//4} tokens)")
+        
+        # Create prompt for LLM
+        prompt = f"""أنت مساعد قانوني متخصص. بناءً على المواد القانونية التالية، أجب على سؤال المستخدم بدقة ووضوح.
+
+المواد القانونية ذات الصلة:
+{context}
+اعكس النص لانه معكوس حتى تستطيع الاستدلال بدقة
+سؤال المستخدم: {question}
+
+تعليمات:
+
+- اذكر أرقام المواد المرجعية في إجابتك
+- قدم إجابة شاملة ومفصلة
+- إذا لم تجد معلومات كافية، اذكر ذلك بوضوح
+- استخدم اللغة العربية الفصحى"""
+
+        # Check final prompt size
+        prompt_chars = len(prompt)
+        estimated_tokens = prompt_chars // 4
+        print(f"Final prompt: {prompt_chars} characters (~{estimated_tokens} tokens)")
+        
+        if estimated_tokens > 25000:  # Leave room for response
+            print("WARNING: Prompt still too large, truncating context further...")
+            context = context[:15000] + "\n\n[... النص مقطوع بسبب حدود النموذج ...]"
+            prompt = f"""أنت مساعد قانوني متخصص. بناءً على المواد القانونية التالية، أجب على سؤال المستخدم بدقة ووضوح.
+
+المواد القانونية ذات الصلة:
+{context}
+اذا لاحظت ان المادة معكوسة ف اعد ترتيبها
+
+سؤال المستخدم: {question}
+
+تعليمات:
+
+- اذكر أرقام المواد المرجعية في إجابتك
+- قدم إجابة شاملة ومفصلة
+- إذا لم تجد معلومات كافية، يمكنك الاجابة بمعلوماتك انت
+- استخدم اللغة العربية الفصحى"""
+
+        try:
+            print("Calling Gemini API...")
+            completion = gemini_model.generate_content(
+                prompt,
+                generation_config={
+                    "temperature": 0.3,
+                    "max_output_tokens": 8192
+                    }
+                )
+            
+            return top_articles, completion.text
+            
+        except Exception as e:
+            print(f"Error calling Gemini API: {e}")
+            return top_articles, f"خطأ في معالجة الطلب: {str(e)}"
+            
+    except Exception as e:
+        print(f"Error in database query: {e}")
+        return [], f"خطأ في البحث: {str(e)}"
+
+# Check if collection is empty
+existing = collection.count()
+print(f"Existing documents in collection: {existing}")
+
+if existing == 0:
+    print("Starting document processing and embedding...")
+    
+    def split_into_articles(text: str) -> list[str]:
+        """
+        Split text into articles when finding 'مادة'
+        Keep 'مادة' as part of each chunk
+        """
+        # Debug print the input text
+        print("\nInput text sample:")
+        print("-" * 50)
+        print(text[:500])
+        print("-" * 50)
+        
+        # Keep the split word as part of each chunk
+        parts = text.split('ةدام')
+        print(f"\nNumber of parts after split: {len(parts)}")
+        print("First few parts:")
+        for i, part in enumerate(parts[:3]):
+            print(f"\nPart {i}:")
+            print("-" * 30)
+            print(part[:100])
+            print("-" * 30)
+        print(len(parts))
+        print("this is my commmmmmmmmmmmmmmmment")
+        realparts = []
+        for i in parts:
+            if i.strip():  # Only add non-empty parts
+                realparts.append('مادة' + i)
+        
+        print(f"\nNumber of articles created: {len(realparts)}")
+        print("First few articles:")
+        for i, article in enumerate(realparts[:3]):
+            print(f"\nArticle {i}:")
+            print("-" * 30)
+            print(article[:100])
+            print("-" * 30)
+        
+        return realparts
+
+    def open_and_read(pdf_path: str) -> list[dict]:
+        """
+        Extract text from PDF and split into articles
+        NO text formatting - preserve original PDF structure
+        """
+        if not os.path.exists(pdf_path):
+            print(f"Error: PDF file '{pdf_path}' not found!")
+            return []
+            
+        try:
+            doc = fitz.open(pdf_path)
+            all_articles = []
+            article_counter = 0
+            
+            print(f"Processing {len(doc)} pages...")
+            
+            # First, extract all text from all pages
+            full_text = ""
+            for page_number, page in enumerate(doc):
+                # Get text with layout preservation
+                page_text = page.get_text("text")
+                full_text += page_text + "\n"  # Add page break
+                
+                # Debug print for first page
+                if page_number == 0:
+                    print("\nFirst page text sample:")
+                    print("-" * 50)
+                    print(page_text[:500])
+                    print("-" * 50)
+            
+            doc.close()
+            
+            print(f"Extracted {len(full_text)} characters from PDF")
+            print("Sample of extracted text:")
+            print("-" * 50)
+            print(full_text[:500])
+            print("-" * 50)
+            
+            # Split the entire document into articles
+            articles = split_into_articles(full_text)
+            
+            print(f"Found {len(articles)} articles")
+            
+            # Create article objects with metadata
+            for article_text in articles:
+                # Try to extract article number from the text
+                article_match = re.search(r'مادة\s*(\d+|[٠-٩]+)', article_text)
+                article_number_text = article_match.group(1) if article_match else str(article_counter)
+                
+                all_articles.append({
+                    "article_id": article_counter,
+                    "article_number_text": article_number_text,
+                    "article_char_count": len(article_text),
+                    "article_word_count": len(article_text.split()),
+                    "article_token_count": len(article_text) / 4,
+                    "text": article_text,
+                })
+                article_counter += 1
+            
+            # Show sample articles
+            print("\nSample articles found:")
+            for i, article in enumerate(all_articles[:3]):
+                print(f"\nArticle {i+1} (ID: {article['article_id']}):")
+                print(f"Number: {article['article_number_text']}")
+                print(f"Length: {article['article_char_count']} chars")
+                print(f"Preview: {article['text'][:200]}...")
+                print("-" * 40)
+            
+            return all_articles
+            
+        except Exception as e:
+            print(f"Error reading PDF: {e}")
+            return []
+
+    # Process the PDF
+    pdf_path = "law2.pdf"
+    articles_data = open_and_read(pdf_path=pdf_path)
+
+    if not articles_data:
+        print("No articles extracted from PDF. Please check the file.")
+        exit()
+
+    print(f"\nExtracted {len(articles_data)} articles from PDF")
+    print("Starting embedding process...")
+
+    # Embed and store each article individually in ChromaDB
+    successful_embeddings = 0
+    failed_embeddings = 0
+
+    print("\nProcessing articles for embedding:")
+    for article in tqdm(articles_data, desc="Embedding articles"):
+        try:
+            # Print article details
+            print(f"\nProcessing article {article['article_id']} (Number: {article['article_number_text']})")
+            print(f"Length: {article['article_char_count']} chars, {article['article_word_count']} words")
+            
+            # Prepare text for embedding (using E5 format)
+            embedding_text = f"passage: {article['text']}"
+            article_embedding = get_embedding(embedding_text)
+            
+            if article_embedding:  # Check if embedding was successful
+                # Add to ChromaDB
+                collection.add(
+                    documents=[article['text']],
+                    embeddings=[article_embedding],
+                    metadatas=[{
+                        "article_id": article['article_id'],
+                        "article_number": article['article_number_text'],
+                        "char_count": article['article_char_count'],
+                        "word_count": article['article_word_count']
+                    }],
+                    ids=[f"article_{article['article_id']}"]
+                )
+                successful_embeddings += 1
+                print(f"✅ Successfully embedded article {article['article_id']}")
+            else:
+                failed_embeddings += 1
+                print(f"❌ Failed to generate embedding for article {article['article_id']}")
+                
+        except Exception as e:
+            failed_embeddings += 1
+            print(f"❌ Error embedding article {article['article_id']}: {e}")
+
+    print(f"\nEmbedding Summary:")
+    print(f"Total articles processed: {len(articles_data)}")
+    print(f"✅ Successfully embedded: {successful_embeddings}")
+    print(f"❌ Failed to embed: {failed_embeddings}")
+    print(f"📊 Success rate: {(successful_embeddings/len(articles_data))*100:.2f}%")
+
+    # Verify final collection state
+    final_count = collection.count()
+    print(f"\nFinal collection count: {final_count}")
+
+    # Print detailed count information
+    print("\nDatabase Statistics:")
+    print(f"Number of collections: {len(client.list_collections())}")
+    print(f"Number of chunks in collection '{collection.name}': {final_count}")
+    print(f"Storage path: ./chroma_store")
+
+    # Test the system
+    if final_count > 0:
+        print("\n" + "="*60)
+        print("TESTING THE SYSTEM")
+        print("="*60)
+        
+        # Test query
+        test_query = "ما هي الجرائم التي يعاقب عليها القانون"
+        print(f"\nTesting with query: {test_query}")
+        
+        top_articles, llm_response = query_rag(test_query, n_results=3)
+        
+        if top_articles:
+            print(f"\n{'='*50}")
+            print("RETRIEVED ARTICLES:")
+            print("="*50)
+            for i, article in enumerate(top_articles, 1):
+                print(f"\nArticle {i}:")
+                print("-" * 30)
+                print(article[:400] + "..." if len(article) > 400 else article)
+                print("-" * 30)
+        
+        print(f"\n{'='*50}")
+        print("LLM RESPONSE:")
+        print("="*50)
+        print(llm_response)
+        print("="*50)
+        
+        # Interactive mode
+        print(f"\n{'='*50}")
+        print("INTERACTIVE MODE (type 'quit' to exit)")
+        print("="*50)
+        
+        while True:
+            user_query = input("\nأدخل سؤالك القانوني: ").strip()
+            if user_query.lower() in ['quit', 'exit', 'خروج']:
+                break
+            if user_query:
+                try:
+                    articles, response = query_rag(user_query, n_results=3)
+                    print(f"\n{'='*40}")
+                    print("الإجابة:")
+                    print("="*40)
+                    print(response)
+                    print("="*40)
+                except Exception as e:
+                    print(f"خطأ في معالجة السؤال: {e}")
+    else:
+        print("Error: No articles were embedded. Please check your PDF file and try again.")
+else:
+    print(f"Collection already contains {existing} documents. Ready for querying.")
+    
+    # Interactive mode
+    print(f"\n{'='*50}")
+    print("INTERACTIVE MODE (type 'quit' to exit)")
+    print("="*50)
+    """  
+    while True:
+        user_query = input("\nأدخل سؤالك القانوني: ").strip()
+        if user_query.lower() in ['quit', 'exit', 'خروج']:
+            break
+        if user_query:
+            try:
+                articles, response = query_rag(user_query)
+                print(f"\n{'='*40}")
+                print("الإجابة:")
+                print("="*40)
+                print(response)
+                print("="*40)
+            except Exception as e:
+                print(f"خطأ في معالجة السؤال: {e}")"""
